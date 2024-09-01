@@ -2,7 +2,6 @@ Sure! Here's a revised version of the `README.md` without the folder structure a
 
 ### README.md
 
-```markdown
 # CustomMembershipProvider.Core
 
 ## Overview
