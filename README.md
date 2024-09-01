@@ -1,7 +1,3 @@
-Sure! Here's a revised version of the `README.md` without the folder structure and references to the test project:
-
-### README.md
-
 # CustomMembershipProvider.Core
 
 ## Overview
