@@ -219,7 +219,7 @@ namespace CustomMembershipProvider.Core.Providers
         }
 
 
-        public override MembershipUser CreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+        public MembershipUser CreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
         {
             // Validate password parameter
             if (!SecUtility.ValidateParameter(ref password, true, true, false, 128)) {
