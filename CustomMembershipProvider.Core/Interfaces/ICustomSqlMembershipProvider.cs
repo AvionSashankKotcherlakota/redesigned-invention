@@ -21,6 +21,9 @@ namespace CustomMembershipProvider.Core.Interfaces
         string PasswordStrengthRegularExpression { get; }
         bool RequiresQuestionAndAnswer { get; }
         bool RequiresUniqueEmail { get; }
+        int UserIsOnlineTimeWindow { get; }
+        string Name { get; }
+        string Description { get; }
 
         bool ChangePassword(string username, string oldPassword, string newPassword);
         bool ChangePasswordQuestionAndAnswer(string username, string password, string newPasswordQuestion, string newPasswordAnswer);
@@ -40,6 +43,8 @@ namespace CustomMembershipProvider.Core.Interfaces
         bool UnlockUser(string username);
         void UpdateUser(MembershipUser user);
         bool ValidateUser(string username, string password);
+        byte[] EncryptPassword(byte[] password);
+        byte[] EncryptPassword(byte[] password, MembershipPasswordCompatibilityMode legacyPasswordCompatibilityMode);
     }
 
 }
