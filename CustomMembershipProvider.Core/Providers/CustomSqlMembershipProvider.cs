@@ -18,7 +18,8 @@ namespace CustomMembershipProvider.Core.Providers
 {
     public class CustomSqlMembershipProvider : ICustomSqlMembershipProvider
     {
-        private readonly IDataProtector _protector;
+        private readonly IMembershipDataAccess _membershipDataAccess;
+        private readonly IPasswordUtility _passwordUtility;
 
         private string _applicationName;
         private string _name;
@@ -38,10 +39,6 @@ namespace CustomMembershipProvider.Core.Providers
         private int _commandTimeout;
         private int _userIsOnlineTimeWindow;
 
-        private string _hashAlgorithmName;
-        private MembershipPasswordCompatibilityMode _legacyPasswordCompatibilityMode = MembershipPasswordCompatibilityMode.Framework20; // Default to Framework20 for compatibility
-
-
         private MembershipValidatePasswordEventHandler _EventHandler;
 
         public string ApplicationName
@@ -60,9 +57,8 @@ namespace CustomMembershipProvider.Core.Providers
         public string PasswordStrengthRegularExpression => _passwordStrengthRegularExpression;
         public bool RequiresQuestionAndAnswer => _requiresQuestionAndAnswer;
         public bool RequiresUniqueEmail => _requiresUniqueEmail;
-
         public int UserIsOnlineTimeWindow => _userIsOnlineTimeWindow;
-
+        public int CommandTimeout => this._commandTimeout;
         public string Name => _name;
 
         /// <summary>
@@ -74,28 +70,63 @@ namespace CustomMembershipProvider.Core.Providers
             get => !string.IsNullOrEmpty(_description) ? _description : Name;
         }
 
-
-        // Constructor for dependency injection
-        public CustomSqlMembershipProvider(IConfiguration configuration, string connectionStringName, IDataProtectionProvider dataProtectionProvider)
+        public CustomSqlMembershipProvider(IConfiguration configuration, IDataProtectionProvider dataProtectionProvider)
         {
-            _sqlConnectionString = SecUtility.GetConnectionString(configuration, new NameValueCollection { ["connectionStringName"] = connectionStringName });
-            _applicationName = configuration["applicationName"] ?? "MyApp";
-            _requiresQuestionAndAnswer = SecUtility.GetBooleanValue(configuration, "requiresQuestionAndAnswer", true);
-            _requiresUniqueEmail = SecUtility.GetBooleanValue(configuration, "requiresUniqueEmail", true);
-            _enablePasswordRetrieval = SecUtility.GetBooleanValue(configuration, "enablePasswordRetrieval", false);
-            _enablePasswordReset = SecUtility.GetBooleanValue(configuration, "enablePasswordReset", true);
-            _maxInvalidPasswordAttempts = SecUtility.GetIntValue(configuration, "maxInvalidPasswordAttempts", 5, true, 0);
-            _passwordAttemptWindow = SecUtility.GetIntValue(configuration, "passwordAttemptWindow", 10, true, 0);
-            _minRequiredPasswordLength = SecUtility.GetIntValue(configuration, "minRequiredPasswordLength", 7, true, 128);
-            _minRequiredNonAlphanumericCharacters = SecUtility.GetIntValue(configuration, "minRequiredNonAlphanumericCharacters", 1, true, 128);
-            _passwordStrengthRegularExpression = configuration["passwordStrengthRegularExpression"];
-            _passwordFormat = MembershipPasswordFormat.Hashed;  // Default password format
-            _schemaVersionCheck = 0;
-            _commandTimeout = SecUtility.GetIntValue(configuration, "commandTimeout", 30, true, 0);
+            _sqlConnectionString = configuration.GetConnectionString("DefaultConnection");
 
-            _userIsOnlineTimeWindow = configuration.GetValue<int>("MembershipSettings:UserIsOnlineTimeWindow", 15);
-            // Initialize the data protector
-            _protector = dataProtectionProvider.CreateProtector("CustomSqlMembershipProvider");
+            // Access all membership settings from "MembershipSettings"
+            var membershipSettings = configuration.GetSection("MembershipSettings");
+
+            _applicationName = membershipSettings.GetValue<string>("ApplicationName") ?? SecUtility.GetDefaultAppName();
+
+            // Check if application name is too long
+            if (_applicationName.Length > 256) {
+                throw new ProviderException("Application name too long. Maximum length is 256 characters.");
+            }
+
+            // Load values directly from the "MembershipSettings" section
+            _requiresQuestionAndAnswer = membershipSettings.GetValue<bool>("RequiresQuestionAndAnswer", true);
+            _requiresUniqueEmail = membershipSettings.GetValue<bool>("RequiresUniqueEmail", true);
+            _enablePasswordRetrieval = membershipSettings.GetValue<bool>("EnablePasswordRetrieval", false);
+            _enablePasswordReset = membershipSettings.GetValue<bool>("EnablePasswordReset", true);
+            _maxInvalidPasswordAttempts = membershipSettings.GetValue<int>("MaxInvalidPasswordAttempts", 5);
+            _passwordAttemptWindow = membershipSettings.GetValue<int>("PasswordAttemptWindow", 10);
+            _minRequiredPasswordLength = membershipSettings.GetValue<int>("MinRequiredPasswordLength", 7);
+            _minRequiredNonAlphanumericCharacters = membershipSettings.GetValue<int>("MinRequiredNonAlphanumericCharacters", 1);
+            _passwordStrengthRegularExpression = membershipSettings.GetValue<string>("PasswordStrengthRegularExpression", string.Empty);
+
+            if (!string.IsNullOrEmpty(_passwordStrengthRegularExpression)) {
+                _passwordStrengthRegularExpression = _passwordStrengthRegularExpression.Trim();
+                try {
+                    Regex regex = new Regex(_passwordStrengthRegularExpression);
+                }
+                catch (ArgumentException ex) {
+                    throw new ProviderException("Invalid password strength regular expression: " + ex.Message);
+                }
+            }
+
+            string passwordFormatConfig = membershipSettings.GetValue<string>("PasswordFormat") ?? "Hashed";
+            switch (passwordFormatConfig) {
+                case "Clear":
+                    _passwordFormat = MembershipPasswordFormat.Clear;
+                    break;
+                case "Encrypted":
+                    _passwordFormat = MembershipPasswordFormat.Encrypted;
+                    break;
+                case "Hashed":
+                    _passwordFormat = MembershipPasswordFormat.Hashed;
+                    break;
+                default:
+                    throw new ProviderException("Invalid password format: " + passwordFormatConfig);
+            }
+
+            if (_passwordFormat == MembershipPasswordFormat.Hashed && _enablePasswordRetrieval) {
+                throw new ProviderException("Cannot retrieve hashed passwords.");
+            }
+
+            _schemaVersionCheck = 0; // Initialize as default (0)
+            _commandTimeout = membershipSettings.GetValue<int>("CommandTimeout", 30); // Command timeout in seconds
+            _userIsOnlineTimeWindow = membershipSettings.GetValue<int>("UserIsOnlineTimeWindow", 15); // Default online window
         }
 
         public bool ChangePassword(string username, string oldPassword, string newPassword)
@@ -107,7 +138,7 @@ namespace CustomMembershipProvider.Core.Providers
 
             string salt = (string)null;
             int passwordFormat;
-            if (!this.CheckPassword(username, oldPassword, false, false, out salt, out passwordFormat))
+            if (!_membershipDataAccess.CheckPassword(username, oldPassword, false, false, ApplicationName, MaxInvalidPasswordAttempts, PasswordAttemptWindow, out salt, out passwordFormat, ref _schemaVersionCheck))
                 return false;
 
             // Check password complexity and length constraints
@@ -141,7 +172,7 @@ namespace CustomMembershipProvider.Core.Providers
             }
 
             // Encode the new password
-            string encodedPassword = EncodePassword(newPassword, passwordFormat, salt);
+            string encodedPassword = _passwordUtility.EncodePassword(newPassword, passwordFormat, salt);
 
             if (encodedPassword.Length > 128)  // Assuming 128 is the maximum allowed length for encoded passwords
             {
@@ -184,7 +215,7 @@ namespace CustomMembershipProvider.Core.Providers
             // Check the provided password and retrieve salt and format
             string salt;
             int passwordFormat;
-            if (!CheckPassword(username, password, false, false, out salt, out passwordFormat)) {
+            if (!_membershipDataAccess.CheckPassword(username, password, false, false, ApplicationName, MaxInvalidPasswordAttempts, PasswordAttemptWindow, out salt, out passwordFormat, ref _schemaVersionCheck)) {
                 return false;  // Provided password is incorrect
             }
 
@@ -202,7 +233,7 @@ namespace CustomMembershipProvider.Core.Providers
             // Encode the new password answer if it's not null or empty
             string encodedAnswer = string.IsNullOrEmpty(newPasswordAnswer)
                 ? newPasswordAnswer
-                : EncodePassword(newPasswordAnswer.ToLower(CultureInfo.InvariantCulture), passwordFormat, salt);
+                : _passwordUtility.EncodePassword(newPasswordAnswer.ToLower(CultureInfo.InvariantCulture), passwordFormat, salt);
 
             // Validate the encoded answer
             SecUtility.CheckParameter(ref encodedAnswer, RequiresQuestionAndAnswer, RequiresQuestionAndAnswer, false, 128, nameof(newPasswordAnswer));
@@ -241,8 +272,8 @@ namespace CustomMembershipProvider.Core.Providers
             }
 
             // Generate salt and encode password
-            string salt = GenerateSalt();
-            string encodedPassword = EncodePassword(password, (int)_passwordFormat, salt);
+            string salt = _passwordUtility.GenerateSalt();
+            string encodedPassword = _passwordUtility.EncodePassword(password, (int)_passwordFormat, salt);
             if (encodedPassword.Length > 128) {
                 status = MembershipCreateStatus.InvalidPassword;
                 return null;
@@ -254,7 +285,7 @@ namespace CustomMembershipProvider.Core.Providers
             }
 
             string encodedPasswordAnswer = !string.IsNullOrEmpty(passwordAnswer)
-                ? EncodePassword(passwordAnswer.ToLower(CultureInfo.InvariantCulture), (int)_passwordFormat, salt)
+                ? _passwordUtility.EncodePassword(passwordAnswer.ToLower(CultureInfo.InvariantCulture), (int)_passwordFormat, salt)
                 : passwordAnswer;
 
             if (!SecUtility.ValidateParameter(ref encodedPasswordAnswer, RequiresQuestionAndAnswer, true, false, 128)) {
@@ -312,7 +343,7 @@ namespace CustomMembershipProvider.Core.Providers
                         // Database interaction
                         using (SqlConnection connection = new SqlConnection(_sqlConnectionString)) {
                             connection.Open();
-                            CheckSchemaVersion(connection);
+                            _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                             DateTime utcNow = DateTime.UtcNow;
                             using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_CreateUser", connection)) {
@@ -320,20 +351,20 @@ namespace CustomMembershipProvider.Core.Providers
                                 cmd.CommandType = CommandType.StoredProcedure;
 
                                 // Add parameters to the stored procedure
-                                cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                                cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                                cmd.Parameters.Add(CreateInputParam("@Password", SqlDbType.NVarChar, encodedPassword));
-                                cmd.Parameters.Add(CreateInputParam("@PasswordSalt", SqlDbType.NVarChar, salt));
-                                cmd.Parameters.Add(CreateInputParam("@Email", SqlDbType.NVarChar, email));
-                                cmd.Parameters.Add(CreateInputParam("@PasswordQuestion", SqlDbType.NVarChar, passwordQuestion));
-                                cmd.Parameters.Add(CreateInputParam("@PasswordAnswer", SqlDbType.NVarChar, encodedPasswordAnswer));
-                                cmd.Parameters.Add(CreateInputParam("@IsApproved", SqlDbType.Bit, isApproved));
-                                cmd.Parameters.Add(CreateInputParam("@UniqueEmail", SqlDbType.Int, RequiresUniqueEmail ? 1 : 0));
-                                cmd.Parameters.Add(CreateInputParam("@PasswordFormat", SqlDbType.Int, (int)_passwordFormat));
-                                cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, utcNow));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, username));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@Password", SqlDbType.NVarChar, encodedPassword));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordSalt", SqlDbType.NVarChar, salt));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@Email", SqlDbType.NVarChar, email));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordQuestion", SqlDbType.NVarChar, passwordQuestion));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordAnswer", SqlDbType.NVarChar, encodedPasswordAnswer));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@IsApproved", SqlDbType.Bit, isApproved));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UniqueEmail", SqlDbType.Int, RequiresUniqueEmail ? 1 : 0));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordFormat", SqlDbType.Int, (int)_passwordFormat));
+                                cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, utcNow));
 
                                 // Handle user key (if provided)
-                                SqlParameter userIdParam = CreateInputParam("@UserId", SqlDbType.UniqueIdentifier, providerUserKey);
+                                SqlParameter userIdParam = MembershipDataAccess.CreateInputParam("@UserId", SqlDbType.UniqueIdentifier, providerUserKey);
                                 userIdParam.Direction = ParameterDirection.InputOutput;
                                 cmd.Parameters.Add(userIdParam);
 
@@ -394,19 +425,19 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Users_DeleteUser", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, username));
 
                         // Determine the tables to delete from based on the deleteAllRelatedData flag
                         int tablesToDeleteFrom = deleteAllRelatedData ? 15 : 1;
-                        cmd.Parameters.Add(CreateInputParam("@TablesToDeleteFrom", SqlDbType.Int, tablesToDeleteFrom));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@TablesToDeleteFrom", SqlDbType.Int, tablesToDeleteFrom));
 
                         SqlParameter outputParam = new SqlParameter("@NumTablesDeletedFrom", SqlDbType.Int) {
                             Direction = ParameterDirection.Output
@@ -433,7 +464,7 @@ namespace CustomMembershipProvider.Core.Providers
 
         public byte[] EncryptPassword(byte[] password, MembershipPasswordCompatibilityMode legacyPasswordCompatibilityMode)
         {
-            return EncryptOrDecryptData(true, password, legacyPasswordCompatibilityMode == MembershipPasswordCompatibilityMode.Framework20);
+            return _passwordUtility.EncryptPassword(password, legacyPasswordCompatibilityMode);
         }
 
         public MembershipUserCollection FindUsersByEmail(string emailToMatch, int pageIndex, int pageSize, out int totalRecords)
@@ -456,7 +487,7 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_FindUsersByEmail", connection)) {
                         MembershipUserCollection usersByEmail = new MembershipUserCollection();
@@ -464,10 +495,10 @@ namespace CustomMembershipProvider.Core.Providers
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@EmailToMatch", SqlDbType.NVarChar, emailToMatch));
-                        cmd.Parameters.Add(CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
-                        cmd.Parameters.Add(CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@EmailToMatch", SqlDbType.NVarChar, emailToMatch));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -476,10 +507,10 @@ namespace CustomMembershipProvider.Core.Providers
 
                         using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SequentialAccess)) {
                             while (reader.Read()) {
-                                string username = GetNullableString(reader, 0);
-                                string email = GetNullableString(reader, 1);
-                                string passwordQuestion = GetNullableString(reader, 2);
-                                string comment = GetNullableString(reader, 3);
+                                string username = MembershipDataAccess.GetNullableString(reader, 0);
+                                string email = MembershipDataAccess.GetNullableString(reader, 1);
+                                string passwordQuestion = MembershipDataAccess.GetNullableString(reader, 2);
+                                string comment = MembershipDataAccess.GetNullableString(reader, 3);
                                 bool isApproved = reader.GetBoolean(4);
                                 DateTime creationDate = reader.GetDateTime(5).ToLocalTime();
                                 DateTime lastLoginDate = reader.GetDateTime(6).ToLocalTime();
@@ -540,7 +571,7 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_FindUsersByName", connection)) {
                         MembershipUserCollection usersByName = new MembershipUserCollection();
@@ -548,10 +579,10 @@ namespace CustomMembershipProvider.Core.Providers
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserNameToMatch", SqlDbType.NVarChar, usernameToMatch));
-                        cmd.Parameters.Add(CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
-                        cmd.Parameters.Add(CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserNameToMatch", SqlDbType.NVarChar, usernameToMatch));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -560,10 +591,10 @@ namespace CustomMembershipProvider.Core.Providers
 
                         using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SequentialAccess)) {
                             while (reader.Read()) {
-                                string username = GetNullableString(reader, 0);
-                                string email = GetNullableString(reader, 1);
-                                string passwordQuestion = GetNullableString(reader, 2);
-                                string comment = GetNullableString(reader, 3);
+                                string username = MembershipDataAccess.GetNullableString(reader, 0);
+                                string email = MembershipDataAccess.GetNullableString(reader, 1);
+                                string passwordQuestion = MembershipDataAccess.GetNullableString(reader, 2);
+                                string comment = MembershipDataAccess.GetNullableString(reader, 3);
                                 bool isApproved = reader.GetBoolean(4);
                                 DateTime creationDate = reader.GetDateTime(5).ToLocalTime();
                                 DateTime lastLoginDate = reader.GetDateTime(6).ToLocalTime();
@@ -609,7 +640,7 @@ namespace CustomMembershipProvider.Core.Providers
             int length = MinRequiredPasswordLength < 14 ? 14 : MinRequiredPasswordLength;
             int numberOfNonAlphanumericCharacters = MinRequiredNonAlphanumericCharacters;
 
-            return MembershipHelper.GeneratePassword(length, numberOfNonAlphanumericCharacters);
+            return PasswordUtility.GeneratePassword(length, numberOfNonAlphanumericCharacters);
         }
 
         public MembershipUserCollection GetAllUsers(int pageIndex, int pageSize, out int totalRecords)
@@ -629,16 +660,16 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetAllUsers", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
-                        cmd.Parameters.Add(CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageIndex", SqlDbType.Int, pageIndex));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PageSize", SqlDbType.Int, pageSize));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -647,10 +678,10 @@ namespace CustomMembershipProvider.Core.Providers
 
                         using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SequentialAccess)) {
                             while (reader.Read()) {
-                                string username = GetNullableString(reader, 0);
-                                string email = GetNullableString(reader, 1);
-                                string passwordQuestion = GetNullableString(reader, 2);
-                                string comment = GetNullableString(reader, 3);
+                                string username = MembershipDataAccess.GetNullableString(reader, 0);
+                                string email = MembershipDataAccess.GetNullableString(reader, 1);
+                                string passwordQuestion = MembershipDataAccess.GetNullableString(reader, 2);
+                                string comment = MembershipDataAccess.GetNullableString(reader, 3);
                                 bool isApproved = reader.GetBoolean(4);
                                 DateTime creationDate = reader.GetDateTime(5).ToLocalTime();
                                 DateTime lastLoginDate = reader.GetDateTime(6).ToLocalTime();
@@ -698,16 +729,16 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetNumberOfUsersOnline", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@MinutesSinceLastInActive", SqlDbType.Int, UserIsOnlineTimeWindow));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@MinutesSinceLastInActive", SqlDbType.Int, UserIsOnlineTimeWindow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -734,7 +765,7 @@ namespace CustomMembershipProvider.Core.Providers
             SecUtility.CheckParameter(ref username, true, true, true, 256, nameof(username));
 
             // Encode the provided password answer
-            string encodedPasswordAnswer = this.GetEncodedPasswordAnswer(username, passwordAnswer);
+            string encodedPasswordAnswer = _membershipDataAccess.GetEncodedPasswordAnswer(username, passwordAnswer, ApplicationName, ref _schemaVersionCheck);
 
             // Validate the encoded password answer parameter
             SecUtility.CheckParameter(ref encodedPasswordAnswer, this.RequiresQuestionAndAnswer, this.RequiresQuestionAndAnswer, false, 128, nameof(passwordAnswer));
@@ -743,16 +774,16 @@ namespace CustomMembershipProvider.Core.Providers
             int status = 0;
 
             // Retrieve the password from the database
-            string passwordFromDb = this.GetPasswordFromDB(username, encodedPasswordAnswer, this.RequiresQuestionAndAnswer, out passwordFormat, out status);
+            string passwordFromDb = _membershipDataAccess.GetPasswordFromDB(username, encodedPasswordAnswer, ApplicationName, MaxInvalidPasswordAttempts, PasswordAttemptWindow, this.RequiresQuestionAndAnswer, out passwordFormat, out status, ref _schemaVersionCheck);
 
             // If a password was retrieved, unencode it and return
             if (passwordFromDb != null)
-                return this.UnEncodePassword(passwordFromDb, passwordFormat);
+                return _passwordUtility.UnEncodePassword(passwordFromDb, passwordFormat);
 
             // Handle errors based on the status code
-            string exceptionText = GetExceptionText(status);
+            string exceptionText = MembershipValidation.GetExceptionText(status);
 
-            if (IsStatusDueToBadPassword(status))
+            if (MembershipValidation.IsStatusDueToBadPassword(status))
                 throw new Exception(exceptionText);
 
             throw new ProviderException(exceptionText);
@@ -771,16 +802,16 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetUserByUserId", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@UserId", SqlDbType.UniqueIdentifier, providerUserKey));
-                        cmd.Parameters.Add(CreateInputParam("@UpdateLastActivity", SqlDbType.Bit, userIsOnline));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserId", SqlDbType.UniqueIdentifier, providerUserKey));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UpdateLastActivity", SqlDbType.Bit, userIsOnline));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -791,15 +822,15 @@ namespace CustomMembershipProvider.Core.Providers
                             if (!reader.Read())
                                 return null;
 
-                            string email = GetNullableString(reader, 0);
-                            string passwordQuestion = GetNullableString(reader, 1);
-                            string comment = GetNullableString(reader, 2);
+                            string email = MembershipDataAccess.GetNullableString(reader, 0);
+                            string passwordQuestion = MembershipDataAccess.GetNullableString(reader, 1);
+                            string comment = MembershipDataAccess.GetNullableString(reader, 2);
                             bool isApproved = reader.GetBoolean(3);
                             DateTime creationDate = reader.GetDateTime(4).ToLocalTime();
                             DateTime lastLoginDate = reader.GetDateTime(5).ToLocalTime();
                             DateTime lastActivityDate = reader.GetDateTime(6).ToLocalTime();
                             DateTime lastPasswordChangedDate = reader.GetDateTime(7).ToLocalTime();
-                            string userName = GetNullableString(reader, 8);
+                            string userName = MembershipDataAccess.GetNullableString(reader, 8);
                             bool isLockedOut = reader.GetBoolean(9);
                             DateTime lastLockoutDate = reader.GetDateTime(10).ToLocalTime();
 
@@ -835,17 +866,17 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetUserByName", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                        cmd.Parameters.Add(CreateInputParam("@UpdateLastActivity", SqlDbType.Bit, userIsOnline));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, username));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UpdateLastActivity", SqlDbType.Bit, userIsOnline));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -856,9 +887,9 @@ namespace CustomMembershipProvider.Core.Providers
                             if (!reader.Read())
                                 return null;
 
-                            string email = GetNullableString(reader, 0);
-                            string passwordQuestion = GetNullableString(reader, 1);
-                            string comment = GetNullableString(reader, 2);
+                            string email = MembershipDataAccess.GetNullableString(reader, 0);
+                            string passwordQuestion = MembershipDataAccess.GetNullableString(reader, 1);
+                            string comment = MembershipDataAccess.GetNullableString(reader, 2);
                             bool isApproved = reader.GetBoolean(3);
                             DateTime creationDate = reader.GetDateTime(4).ToLocalTime();
                             DateTime lastLoginDate = reader.GetDateTime(5).ToLocalTime();
@@ -900,15 +931,15 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetUserByEmail", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@Email", SqlDbType.NVarChar, email));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@Email", SqlDbType.NVarChar, email));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -918,7 +949,7 @@ namespace CustomMembershipProvider.Core.Providers
                         using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SequentialAccess)) {
                             string userNameByEmail = null;
                             if (reader.Read()) {
-                                userNameByEmail = GetNullableString(reader, 0);
+                                userNameByEmail = MembershipDataAccess.GetNullableString(reader, 0);
                                 if (RequiresUniqueEmail && reader.Read()) {
                                     throw new ProviderException("More than one user with the same email.");
                                 }
@@ -949,12 +980,12 @@ namespace CustomMembershipProvider.Core.Providers
             int passwordFormat;
             string passwordSalt;
 
-            GetPasswordWithFormat(username, false, out status, out string _, out passwordFormat, out passwordSalt, out int _, out int _, out bool _, out DateTime _, out DateTime _);
+            _membershipDataAccess.GetPasswordWithFormat(username, false, ApplicationName, out status, out string _, out passwordFormat, out passwordSalt, out int _, out int _, out bool _, out DateTime _, out DateTime _, ref _schemaVersionCheck);
 
             if (status != 0) {
-                if (IsStatusDueToBadPassword(status))
-                    throw new Exception(GetExceptionText(status));
-                throw new ProviderException(GetExceptionText(status));
+                if (MembershipValidation.IsStatusDueToBadPassword(status))
+                    throw new Exception(MembershipValidation.GetExceptionText(status));
+                throw new ProviderException(MembershipValidation.GetExceptionText(status));
             }
 
             if (passwordAnswer != null)
@@ -962,7 +993,7 @@ namespace CustomMembershipProvider.Core.Providers
 
             string encodedPasswordAnswer = string.IsNullOrEmpty(passwordAnswer)
                 ? passwordAnswer
-                : EncodePassword(passwordAnswer.ToLower(CultureInfo.InvariantCulture), passwordFormat, passwordSalt);
+                : _passwordUtility.EncodePassword(passwordAnswer.ToLower(CultureInfo.InvariantCulture), passwordFormat, passwordSalt);
 
             SecUtility.CheckParameter(ref encodedPasswordAnswer, RequiresQuestionAndAnswer, RequiresQuestionAndAnswer, false, 128, nameof(passwordAnswer));
 
@@ -981,24 +1012,24 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_ResetPassword", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                        cmd.Parameters.Add(CreateInputParam("@NewPassword", SqlDbType.NVarChar, EncodePassword(newPassword, passwordFormat, passwordSalt)));
-                        cmd.Parameters.Add(CreateInputParam("@MaxInvalidPasswordAttempts", SqlDbType.Int, MaxInvalidPasswordAttempts));
-                        cmd.Parameters.Add(CreateInputParam("@PasswordAttemptWindow", SqlDbType.Int, PasswordAttemptWindow));
-                        cmd.Parameters.Add(CreateInputParam("@PasswordSalt", SqlDbType.NVarChar, passwordSalt));
-                        cmd.Parameters.Add(CreateInputParam("@PasswordFormat", SqlDbType.Int, passwordFormat));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, username));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@NewPassword", SqlDbType.NVarChar, _passwordUtility.EncodePassword(newPassword, passwordFormat, passwordSalt)));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@MaxInvalidPasswordAttempts", SqlDbType.Int, MaxInvalidPasswordAttempts));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordAttemptWindow", SqlDbType.Int, PasswordAttemptWindow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordSalt", SqlDbType.NVarChar, passwordSalt));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordFormat", SqlDbType.Int, passwordFormat));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
 
                         if (RequiresQuestionAndAnswer) {
-                            cmd.Parameters.Add(CreateInputParam("@PasswordAnswer", SqlDbType.NVarChar, encodedPasswordAnswer));
+                            cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@PasswordAnswer", SqlDbType.NVarChar, encodedPasswordAnswer));
                         }
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
@@ -1012,8 +1043,8 @@ namespace CustomMembershipProvider.Core.Providers
                         if (resetStatus == 0)
                             return newPassword;
 
-                        string exceptionText = GetExceptionText(resetStatus);
-                        if (IsStatusDueToBadPassword(resetStatus))
+                        string exceptionText = MembershipValidation.GetExceptionText(resetStatus);
+                        if (MembershipValidation.IsStatusDueToBadPassword(resetStatus))
                             throw new Exception(exceptionText);
                         throw new ProviderException(exceptionText);
                     }
@@ -1033,15 +1064,15 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_UnlockUser", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, username));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -1077,22 +1108,22 @@ namespace CustomMembershipProvider.Core.Providers
                     connection.Open();
 
                     // Check schema version
-                    CheckSchemaVersion(connection);
+                    _membershipDataAccess.CheckSchemaVersion(connection, ref _schemaVersionCheck);
 
                     using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_UpdateUser", connection)) {
                         cmd.CommandTimeout = CommandTimeout;
                         cmd.CommandType = CommandType.StoredProcedure;
 
                         // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, user.UserName));
-                        cmd.Parameters.Add(CreateInputParam("@Email", SqlDbType.NVarChar, user.Email));
-                        cmd.Parameters.Add(CreateInputParam("@Comment", SqlDbType.NText, user.Comment));
-                        cmd.Parameters.Add(CreateInputParam("@IsApproved", SqlDbType.Bit, user.IsApproved ? 1 : 0));
-                        cmd.Parameters.Add(CreateInputParam("@LastLoginDate", SqlDbType.DateTime, user.LastLoginDate.ToUniversalTime()));
-                        cmd.Parameters.Add(CreateInputParam("@LastActivityDate", SqlDbType.DateTime, user.LastActivityDate.ToUniversalTime()));
-                        cmd.Parameters.Add(CreateInputParam("@UniqueEmail", SqlDbType.Int, RequiresUniqueEmail ? 1 : 0));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UserName", SqlDbType.NVarChar, user.UserName));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@Email", SqlDbType.NVarChar, user.Email));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@Comment", SqlDbType.NText, user.Comment));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@IsApproved", SqlDbType.Bit, user.IsApproved ? 1 : 0));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@LastLoginDate", SqlDbType.DateTime, user.LastLoginDate.ToUniversalTime()));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@LastActivityDate", SqlDbType.DateTime, user.LastActivityDate.ToUniversalTime()));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@UniqueEmail", SqlDbType.Int, RequiresUniqueEmail ? 1 : 0));
+                        cmd.Parameters.Add(MembershipDataAccess.CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
 
                         SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
                             Direction = ParameterDirection.ReturnValue
@@ -1103,7 +1134,7 @@ namespace CustomMembershipProvider.Core.Providers
 
                         int status = returnValue.Value != null ? (int)returnValue.Value : -1;
                         if (status != 0)
-                            throw new ProviderException(GetExceptionText(status));
+                            throw new ProviderException(MembershipValidation.GetExceptionText(status));
                     }
                 }
             }
@@ -1116,418 +1147,12 @@ namespace CustomMembershipProvider.Core.Providers
         {
             if (SecUtility.ValidateParameter(ref username, true, true, true, 256) &&
                 SecUtility.ValidateParameter(ref password, true, true, false, 128) &&
-                this.CheckPassword(username, password, true, true)) {
+                _membershipDataAccess.CheckPassword(username, password, true, true, ApplicationName, MaxInvalidPasswordAttempts, PasswordAttemptWindow, ref _schemaVersionCheck)) {
                 return true;
             }
 
             return false;
         }
-
-
-        #region Helper Methods
-
-        private string GenerateSalt()
-        {
-            byte[] buffer = new byte[16];
-            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider()) {
-                rng.GetBytes(buffer);
-            }
-            return Convert.ToBase64String(buffer);
-        }
-
-        private string EncodePassword(string pass, int passwordFormat, string salt)
-        {
-            if (passwordFormat == 0) // MembershipPasswordFormat.Clear
-            {
-                return pass;
-            }
-
-            byte[] passwordBytes = Encoding.Unicode.GetBytes(pass);
-            byte[] saltBytes = Convert.FromBase64String(salt);
-            byte[] inArray;
-
-            if (passwordFormat == 1) // MembershipPasswordFormat.Hashed
-            {
-                using (HashAlgorithm hashAlgorithm = GetHashAlgorithm()) {
-                    if (hashAlgorithm is KeyedHashAlgorithm keyedHashAlgorithm) {
-                        // Handle KeyedHashAlgorithm with salt as key
-                        keyedHashAlgorithm.Key = GetKeyedHashKey(keyedHashAlgorithm, saltBytes);
-                        inArray = keyedHashAlgorithm.ComputeHash(passwordBytes);
-                    } else {
-                        // Combine salt and password bytes and hash them
-                        byte[] saltedPassword = CombineBytes(saltBytes, passwordBytes);
-                        inArray = hashAlgorithm.ComputeHash(saltedPassword);
-                    }
-                }
-            } else // MembershipPasswordFormat.Encrypted
-              {
-                byte[] saltedPassword = CombineBytes(saltBytes, passwordBytes);
-                inArray = EncryptPassword(saltedPassword);
-            }
-
-            return Convert.ToBase64String(inArray);
-        }
-
-        private byte[] GetKeyedHashKey(KeyedHashAlgorithm algorithm, byte[] salt)
-        {
-            if (algorithm.Key.Length == salt.Length) {
-                return salt;
-            } else if (algorithm.Key.Length < salt.Length) {
-                byte[] key = new byte[algorithm.Key.Length];
-                Buffer.BlockCopy(salt, 0, key, 0, key.Length);
-                return key;
-            } else {
-                byte[] key = new byte[algorithm.Key.Length];
-                int count;
-                for (int dstOffset = 0; dstOffset < key.Length; dstOffset += count) {
-                    count = Math.Min(salt.Length, key.Length - dstOffset);
-                    Buffer.BlockCopy(salt, 0, key, dstOffset, count);
-                }
-                return key;
-            }
-        }
-
-        private byte[] CombineBytes(byte[] first, byte[] second)
-        {
-            byte[] combined = new byte[first.Length + second.Length];
-            Buffer.BlockCopy(first, 0, combined, 0, first.Length);
-            Buffer.BlockCopy(second, 0, combined, first.Length, second.Length);
-            return combined;
-        }
-
-        private void GetPasswordWithFormat(string username, bool updateLastLoginActivityDate, out int status, out string password, out int passwordFormat, out string passwordSalt,
-                                        out int failedPasswordAttemptCount, out int failedPasswordAnswerAttemptCount, out bool isApproved, out DateTime lastLoginDate, out DateTime lastActivityDate)
-        {
-            try {
-                using (SqlConnection connection = new SqlConnection(_sqlConnectionString)) {
-                    connection.Open();
-
-                    // Check schema version
-                    CheckSchemaVersion(connection);
-
-                    using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetPasswordWithFormat", connection)) {
-                        cmd.CommandTimeout = CommandTimeout;
-                        cmd.CommandType = CommandType.StoredProcedure;
-
-                        // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                        cmd.Parameters.Add(CreateInputParam("@UpdateLastLoginActivityDate", SqlDbType.Bit, updateLastLoginActivityDate));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
-
-                        SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
-                            Direction = ParameterDirection.ReturnValue
-                        };
-                        cmd.Parameters.Add(returnValue);
-
-                        using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SingleRow)) {
-                            status = -1;
-
-                            if (reader.Read()) {
-                                password = reader.GetString(0);
-                                passwordFormat = reader.GetInt32(1);
-                                passwordSalt = reader.GetString(2);
-                                failedPasswordAttemptCount = reader.GetInt32(3);
-                                failedPasswordAnswerAttemptCount = reader.GetInt32(4);
-                                isApproved = reader.GetBoolean(5);
-                                lastLoginDate = reader.GetDateTime(6);
-                                lastActivityDate = reader.GetDateTime(7);
-                            } else {
-                                password = null;
-                                passwordFormat = 0;
-                                passwordSalt = null;
-                                failedPasswordAttemptCount = 0;
-                                failedPasswordAnswerAttemptCount = 0;
-                                isApproved = false;
-                                lastLoginDate = DateTime.UtcNow;
-                                lastActivityDate = DateTime.UtcNow;
-                            }
-                        }
-
-                        status = returnValue.Value != null ? (int)returnValue.Value : -1;
-                    }
-                }
-            }
-            catch (Exception ex) {
-                throw new ProviderException("Error retrieving password with format.", ex);
-            }
-        }
-
-        private string GetPasswordFromDB(string username, string passwordAnswer, bool requiresQuestionAndAnswer, out int passwordFormat, out int status)
-        {
-            try {
-                using (SqlConnection connection = new SqlConnection(_sqlConnectionString)) {
-                    connection.Open();
-
-                    // Check schema version
-                    CheckSchemaVersion(connection);
-
-                    using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_GetPassword", connection)) {
-                        cmd.CommandTimeout = CommandTimeout;
-                        cmd.CommandType = CommandType.StoredProcedure;
-
-                        // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                        cmd.Parameters.Add(CreateInputParam("@MaxInvalidPasswordAttempts", SqlDbType.Int, MaxInvalidPasswordAttempts));
-                        cmd.Parameters.Add(CreateInputParam("@PasswordAttemptWindow", SqlDbType.Int, PasswordAttemptWindow));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, DateTime.UtcNow));
-
-                        if (requiresQuestionAndAnswer)
-                            cmd.Parameters.Add(CreateInputParam("@PasswordAnswer", SqlDbType.NVarChar, passwordAnswer));
-
-                        SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
-                            Direction = ParameterDirection.ReturnValue
-                        };
-                        cmd.Parameters.Add(returnValue);
-
-                        using (SqlDataReader reader = cmd.ExecuteReader(CommandBehavior.SingleRow)) {
-                            status = -1;
-                            string passwordFromDb = null;
-
-                            if (reader.Read()) {
-                                passwordFromDb = reader.GetString(0);
-                                passwordFormat = reader.GetInt32(1);
-                            } else {
-                                passwordFromDb = null;
-                                passwordFormat = 0;
-                            }
-
-                            status = returnValue.Value != null ? (int)returnValue.Value : -1;
-                            return passwordFromDb;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex) {
-                throw new ProviderException("Error retrieving password from database.", ex);
-            }
-        }
-
-        private SqlParameter CreateInputParam(string paramName, SqlDbType dbType, object objValue)
-        {
-            SqlParameter inputParam = new SqlParameter(paramName, dbType);
-            if (objValue == null) {
-                inputParam.IsNullable = true;
-                inputParam.Value = DBNull.Value;
-            } else {
-                inputParam.Value = objValue;
-            }
-            return inputParam;
-        }
-
-        private bool CheckPassword(string username, string password, bool updateLastLoginActivityDate, bool failIfNotApproved, out string salt, out int passwordFormat)
-        {
-            // Retrieve the stored password information
-            this.GetPasswordWithFormat(username, updateLastLoginActivityDate, out int status, out string storedPassword, out passwordFormat, out salt,
-                out int failedPasswordAttemptCount, out int failedPasswordAnswerAttemptCount, out bool isApproved, out DateTime lastLoginDate, out DateTime lastActivityDate);
-
-            // Check if the status is not successful or the user is not approved and failIfNotApproved is true
-            if (status != 0 || (!isApproved && failIfNotApproved))
-                return false;
-
-            // Encode the provided password with the same format and salt used for the stored password
-            string encodedPassword = this.EncodePassword(password, passwordFormat, salt);
-
-            // Compare the encoded password with the stored password
-            bool isPasswordCorrect = storedPassword.Equals(encodedPassword);
-
-            // If the password is correct and there are no failed attempts, return true
-            if (isPasswordCorrect && failedPasswordAttemptCount == 0 && failedPasswordAnswerAttemptCount == 0)
-                return true;
-
-            try {
-                using (SqlConnection connection = new SqlConnection(_sqlConnectionString)) {
-                    connection.Open();
-
-                    // Check schema version
-                    CheckSchemaVersion(connection);
-
-                    using (SqlCommand cmd = new SqlCommand("dbo.aspnet_Membership_UpdateUserInfo", connection)) {
-                        DateTime utcNow = DateTime.UtcNow;
-                        cmd.CommandTimeout = CommandTimeout;
-                        cmd.CommandType = CommandType.StoredProcedure;
-
-                        // Add parameters to the stored procedure
-                        cmd.Parameters.Add(CreateInputParam("@ApplicationName", SqlDbType.NVarChar, ApplicationName));
-                        cmd.Parameters.Add(CreateInputParam("@UserName", SqlDbType.NVarChar, username));
-                        cmd.Parameters.Add(CreateInputParam("@IsPasswordCorrect", SqlDbType.Bit, isPasswordCorrect));
-                        cmd.Parameters.Add(CreateInputParam("@UpdateLastLoginActivityDate", SqlDbType.Bit, updateLastLoginActivityDate));
-                        cmd.Parameters.Add(CreateInputParam("@MaxInvalidPasswordAttempts", SqlDbType.Int, MaxInvalidPasswordAttempts));
-                        cmd.Parameters.Add(CreateInputParam("@PasswordAttemptWindow", SqlDbType.Int, PasswordAttemptWindow));
-                        cmd.Parameters.Add(CreateInputParam("@CurrentTimeUtc", SqlDbType.DateTime, utcNow));
-                        cmd.Parameters.Add(CreateInputParam("@LastLoginDate", SqlDbType.DateTime, isPasswordCorrect ? utcNow : lastLoginDate));
-                        cmd.Parameters.Add(CreateInputParam("@LastActivityDate", SqlDbType.DateTime, isPasswordCorrect ? utcNow : lastActivityDate));
-
-                        SqlParameter returnValue = new SqlParameter("@ReturnValue", SqlDbType.Int) {
-                            Direction = ParameterDirection.ReturnValue
-                        };
-                        cmd.Parameters.Add(returnValue);
-
-                        cmd.ExecuteNonQuery();
-
-                        int result = returnValue.Value != null ? (int)returnValue.Value : -1;
-                    }
-                }
-            }
-            catch (Exception ex) {
-                throw new ProviderException("Error updating user information.", ex);
-            }
-
-            return isPasswordCorrect;
-        }
-
-        private bool CheckPassword(string username, string password, bool updateLastLoginActivityDate, bool failIfNotApproved)
-        {
-            return CheckPassword(username, password, updateLastLoginActivityDate, failIfNotApproved, out string _, out int _);
-        }
-
-        private void CheckSchemaVersion(SqlConnection connection)
-        {
-            string[] features = new string[2]
-            {
-        "Common",
-        "Membership"
-            };
-            string version = "1";
-            SecUtility.CheckSchemaVersion(this, connection, features, version, ref this._schemaVersionCheck);
-        }
-
-        private string GetNullableString(SqlDataReader reader, int col)
-        {
-            return !reader.IsDBNull(col) ? reader.GetString(col) : null;
-        }
-
-        private string GetEncodedPasswordAnswer(string username, string passwordAnswer)
-        {
-            if (passwordAnswer != null)
-                passwordAnswer = passwordAnswer.Trim();
-
-            if (string.IsNullOrEmpty(passwordAnswer))
-                return passwordAnswer;
-
-            int status;
-            int passwordFormat;
-            string passwordSalt;
-
-            // Get the password information including salt, format, etc.
-            this.GetPasswordWithFormat(username, false, out status, out string _, out passwordFormat, out passwordSalt, out int _, out int _, out bool _, out DateTime _, out DateTime _);
-
-            // If the status indicates success, encode the password answer using the format and salt
-            if (status == 0)
-                return this.EncodePassword(passwordAnswer.ToLower(CultureInfo.InvariantCulture), passwordFormat, passwordSalt);
-
-            // If status is not successful, throw an exception with the appropriate message
-            throw new ProviderException(GetExceptionText(status));
-        }
-
-        internal static string GetExceptionText(int status)
-        {
-            string message;
-            switch (status) {
-                case 0:
-                    return string.Empty;
-                case 1:
-                    message = "User not found.";
-                    break;
-                case 2:
-                    message = "Wrong password.";
-                    break;
-                case 3:
-                    message = "Wrong answer.";
-                    break;
-                case 4:
-                    message = "Invalid password.";
-                    break;
-                case 5:
-                    message = "Invalid question.";
-                    break;
-                case 6:
-                    message = "Invalid answer.";
-                    break;
-                case 7:
-                    message = "Invalid email.";
-                    break;
-                case 99:
-                    message = "Account is locked out.";
-                    break;
-                default:
-                    message = "An unknown error occurred.";
-                    break;
-            }
-            return message;
-        }
-
-        private string UnEncodePassword(string pass, int passwordFormat)
-        {
-            if (passwordFormat == 0) // MembershipPasswordFormat.Clear
-                return pass;
-
-            if (passwordFormat == 1) // MembershipPasswordFormat.Hashed
-                throw new ProviderException("Cannot decode a hashed password.");
-
-            byte[] decodedBytes = this.DecryptPassword(Convert.FromBase64String(pass));
-            return decodedBytes != null ? Encoding.Unicode.GetString(decodedBytes, 16, decodedBytes.Length - 16) : null;
-        }
-
-        private byte[] DecryptPassword(byte[] encodedPassword)
-        {
-            try {
-                return EncryptOrDecryptData(false, encodedPassword, false);
-            }
-            catch {
-                throw new ProviderException("Error decrypting password.");
-            }
-        }
-
-        public byte[] EncryptOrDecryptData(bool encrypt, byte[] buffer, bool useLegacyMode)
-        {
-            if (encrypt) {
-                return _protector.Protect(buffer);
-            } else {
-                return _protector.Unprotect(buffer);
-            }
-        }
-
-        internal static bool IsStatusDueToBadPassword(int status)
-        {
-            return (status >= 2 && status <= 6) || status == 99;
-        }
-
-        private DateTime RoundToSeconds(DateTime utcDateTime)
-        {
-            return new DateTime(utcDateTime.Year, utcDateTime.Month, utcDateTime.Day, utcDateTime.Hour, utcDateTime.Minute, utcDateTime.Second, DateTimeKind.Utc);
-        }
-
-        private HashAlgorithm GetHashAlgorithm()
-        {
-            if (!string.IsNullOrEmpty(_hashAlgorithmName)) {
-                return HashAlgorithm.Create(_hashAlgorithmName);
-            }
-
-            // Default hash algorithm
-            string hashName = "SHA1"; // Use SHA1 by default
-
-            if (_legacyPasswordCompatibilityMode == MembershipPasswordCompatibilityMode.Framework20) {
-                hashName = "SHA1"; // SHA1 for Framework 2.0 compatibility
-            }
-
-            // Attempt to create the hash algorithm
-            HashAlgorithm hashAlgorithm = HashAlgorithm.Create(hashName);
-
-            if (hashAlgorithm == null) {
-                throw new InvalidOperationException($"The hash algorithm '{hashName}' could not be created.");
-            }
-
-            // Store the hash algorithm name for future use
-            _hashAlgorithmName = hashName;
-
-            return hashAlgorithm;
-        }
-
-        private int CommandTimeout => this._commandTimeout;
-
-        #endregion
 
         protected virtual void OnValidatingPassword(ValidatePasswordEventArgs e)
         {

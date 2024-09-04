@@ -32,23 +32,6 @@ namespace CustomMembershipProvider.Core.Utilities
             }
         }
 
-        // Method to get the connection string from the configuration
-        internal static string GetConnectionString(IConfiguration configuration, NameValueCollection config)
-        {
-            string connectionString = config["connectionString"];
-            if (!string.IsNullOrEmpty(connectionString))
-                return connectionString;
-
-            string specifiedConnectionString = config["connectionStringName"];
-            if (!string.IsNullOrEmpty(specifiedConnectionString)) {
-                connectionString = configuration.GetConnectionString(specifiedConnectionString);
-                if (!string.IsNullOrEmpty(connectionString))
-                    return connectionString;
-            }
-
-            throw new ProviderException("Connection string not found or specified.");
-        }
-
         // Method to validate the password parameter
         internal static bool ValidatePasswordParameter(ref string param, int maxSize)
         {
@@ -56,12 +39,7 @@ namespace CustomMembershipProvider.Core.Utilities
         }
 
         // Method to validate a parameter with various checks
-        internal static bool ValidateParameter(
-            ref string param,
-            bool checkForNull,
-            bool checkIfEmpty,
-            bool checkForCommas,
-            int maxSize)
+        internal static bool ValidateParameter(ref string param, bool checkForNull, bool checkIfEmpty, bool checkForCommas, int maxSize)
         {
             if (param == null)
                 return !checkForNull;
@@ -86,13 +64,7 @@ namespace CustomMembershipProvider.Core.Utilities
         }
 
         // Method to check the validity of a general parameter
-        internal static void CheckParameter(
-            ref string param,
-            bool checkForNull,
-            bool checkIfEmpty,
-            bool checkForCommas,
-            int maxSize,
-            string paramName)
+        internal static void CheckParameter(ref string param, bool checkForNull, bool checkIfEmpty, bool checkForCommas, int maxSize, string paramName)
         {
             if (param == null) {
                 if (checkForNull)
@@ -111,13 +83,7 @@ namespace CustomMembershipProvider.Core.Utilities
         }
 
         // Method to check the validity of an array parameter
-        internal static void CheckArrayParameter(
-            ref string[] param,
-            bool checkForNull,
-            bool checkIfEmpty,
-            bool checkForCommas,
-            int maxSize,
-            string paramName)
+        internal static void CheckArrayParameter(ref string[] param, bool checkForNull, bool checkIfEmpty, bool checkForCommas, int maxSize, string paramName)
         {
             if (param == null)
                 throw new ArgumentNullException(paramName);
@@ -135,53 +101,8 @@ namespace CustomMembershipProvider.Core.Utilities
             }
         }
 
-        // Method to get a boolean value from configuration
-        internal static bool GetBooleanValue(IConfiguration configuration, string key, bool defaultValue)
-        {
-            string value = configuration[key];
-            if (string.IsNullOrEmpty(value)) {
-                return defaultValue;
-            }
-
-            if (bool.TryParse(value, out bool result)) {
-                return result;
-            }
-
-            throw new ProviderException($"The value for {key} must be a boolean.");
-        }
-
-
-        // Method to get an integer value from configuration
-        internal static int GetIntValue(IConfiguration configuration, string key, int defaultValue, bool zeroAllowed, int maxValueAllowed)
-        {
-            string value = configuration[key];
-            if (string.IsNullOrEmpty(value)) {
-                return defaultValue;
-            }
-
-            if (!int.TryParse(value, out int result)) {
-                throw new ProviderException($"The value for {key} must be an integer.");
-            }
-
-            if (!zeroAllowed && result <= 0) {
-                throw new ProviderException($"{key} must be a positive integer.");
-            }
-
-            if (maxValueAllowed > 0 && result > maxValueAllowed) {
-                throw new ProviderException($"{key} exceeds the maximum allowed value of {maxValueAllowed}.");
-            }
-
-            return result;
-        }
-
-
         // Method to check schema version
-        internal static void CheckSchemaVersion(
-            object provider,
-            SqlConnection connection,
-            string[] features,
-            string version,
-            ref int schemaVersionCheck)
+        internal static void CheckSchemaVersion(object provider, SqlConnection connection, string[] features, string version, ref int schemaVersionCheck)
         {
             if (connection == null)
                 throw new ArgumentNullException(nameof(connection));
