@@ -28,11 +28,10 @@ namespace CustomMembershipProvider.Core.Utilities
         {
             _protector = dataProtectionProvider.CreateProtector("CustomSqlMembershipProvider");
 
-            var securitySettings = configuration.GetSection("SecuritySettings");
-            _hashAlgorithmType = securitySettings.GetValue<string>("HashAlgorithmType", "SHA1");
-            _passwordSaltLength = securitySettings.GetValue<int>("PasswordSaltLength", 16);
-
             var membershipSettings = configuration.GetSection("MembershipSettings");
+            _hashAlgorithmType = membershipSettings.GetValue<string>("HashAlgorithmType", "SHA1");
+            _passwordSaltLength = membershipSettings.GetValue<int>("PasswordSaltLength", 16);
+
             string passwordCompatMode = membershipSettings.GetValue<string>("PasswordCompatMode", "Framework20");
             _legacyPasswordCompatibilityMode = (MembershipPasswordCompatibilityMode)Enum.Parse(typeof(MembershipPasswordCompatibilityMode), passwordCompatMode);
         }
