@@ -70,7 +70,7 @@ namespace CustomMembershipProvider.Core.Providers
             get => !string.IsNullOrEmpty(_description) ? _description : Name;
         }
 
-        public CustomSqlMembershipProvider(IConfiguration configuration, IDataProtectionProvider dataProtectionProvider)
+        public CustomSqlMembershipProvider(IConfiguration configuration, IPasswordUtility passwordUtility, IMembershipDataAccess membershipDataAccess)
         {
             _sqlConnectionString = configuration.GetConnectionString("DefaultConnection");
 
@@ -127,6 +127,9 @@ namespace CustomMembershipProvider.Core.Providers
             _schemaVersionCheck = 0; // Initialize as default (0)
             _commandTimeout = membershipSettings.GetValue<int>("CommandTimeout", 30); // Command timeout in seconds
             _userIsOnlineTimeWindow = membershipSettings.GetValue<int>("UserIsOnlineTimeWindow", 15); // Default online window
+
+            _passwordUtility = passwordUtility;
+            _membershipDataAccess = membershipDataAccess;
         }
 
         public bool ChangePassword(string username, string oldPassword, string newPassword)
